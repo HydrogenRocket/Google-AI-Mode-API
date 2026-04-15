@@ -92,8 +92,7 @@ Only text content is handled. Images, PDFs, or file attachments passed by the cl
 Each request creates a fresh session. There is no persistent conversation state stored on Google's side — prior turns are reconstructed by replaying the message history in the query string. This also means the history itself counts against the URL length limit.
 
 ### Not an official API
-This relies on an undocumented internal Google endpoint and personal session cookies. It can break without warning if Google changes the endpoint, and it is subject to whatever usage limits are attached to your Google account (or the anonymous session if not logged in). Logged-in cookies are generally more stable and less likely to hit bot detection challenges.
-
+This relies on an undocumented internal Google endpoint and personal session cookies, It can break without warning if Google changes the endpoint.
 ## Files
 
 | File | Purpose |
