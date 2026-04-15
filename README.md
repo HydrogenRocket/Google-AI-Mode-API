@@ -1,4 +1,4 @@
-# Google AI Mode Proxy
+# Google AI Mode To OpenAI
 
 An OpenAI-compatible API server that routes requests through Google's AI Mode search (`/async/folif`). Lets you point any OpenAI-compatible client (AnythingLLM, Open WebUI, etc.) at it and get responses from Google's AI.
 
