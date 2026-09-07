@@ -11,6 +11,7 @@ Then query it like any OpenAI API:
       -d '{"model":"google-ai","messages":[{"role":"user","content":"hello"}]}'
 """
 
+import hashlib
 import json
 import re
 import time
@@ -18,7 +19,7 @@ import uuid
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -26,7 +27,7 @@ import httpx
 from markdownify import markdownify as _md
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ class Session:
     fn_elrc: str
     xsrf_folif: str
     turn: int = 0
+    last_used: float = field(default_factory=time.time)
 
 
 def session_from_config() -> Session:
@@ -105,14 +107,53 @@ def session_from_config() -> Session:
 
 
 _sessions: dict[str, Session] = {}
+_SESSION_TTL = 1800   # seconds of inactivity before a conversation's session is dropped
+
+
+def _conv_key(messages: list[dict]) -> str:
+    """Fingerprint a conversation prefix so the same growing history maps to the same key.
+
+    Google's real AI Mode client never resends prior turns — it carries conversation
+    state server-side via ei/elrc/stkp/mstk. We reconstruct that by hashing everything
+    except the newest message; once we reply, we store the session under the hash that
+    includes our reply, so the next request (history + our reply + one new message)
+    hashes its `messages[:-1]` to the same key.
+    """
+    payload = json.dumps(
+        [{"role": m["role"], "content": m["content"]} for m in messages],
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _evict_stale_sessions() -> None:
+    now = time.time()
+    stale = [k for k, s in _sessions.items() if now - s.last_used > _SESSION_TTL]
+    for k in stale:
+        del _sessions[k]
+
+
+def _build_query(messages: list[dict], last: str) -> str:
+    """First turn of a new conversation: last message, with a condensed system
+    prompt appended if present. Continuations never repeat it (see _conv_key).
+
+    The user's message goes FIRST and the system prompt AFTER — Google's topic
+    extraction weights earlier text more heavily, so a short/vague message (e.g.
+    "hi") buried after a long instructional block gets swamped by it and Google
+    falls back to raw web results about the instructional text itself instead of
+    answering. Message-first avoids that."""
+    system_msgs = [m for m in messages if m["role"] == "system"]
+    if not system_msgs:
+        return last
+    system_text = _condense_system("\n".join(m["content"] for m in system_msgs))
+    return f"{last}\n\n[System instructions]\n{system_text}\n[End system instructions]"
+
 
 # ---------------------------------------------------------------------------
 # folif request
 # ---------------------------------------------------------------------------
 
 async def fetch_ai_response(client: httpx.AsyncClient, session: Session, query: str) -> tuple[str, Session]:
-    elrc = session.elrc if session.turn == 0 else (session.fc_elrc or session.fn_elrc or session.elrc)
-
     params = {
         "srtst":  session.srtst,
         "ei":     session.ei,
@@ -125,7 +166,7 @@ async def fetch_ai_response(client: httpx.AsyncClient, session: Session, query: 
         "stkp":   session.stkp,
         "cs":     "1",
         "csuir":  "0",
-        "elrc":   elrc,
+        "elrc":   session.elrc,
         "mstk":   session.mstk,
         "csui":   "3",
         "q":      query,
@@ -160,13 +201,26 @@ _CUT_MARKERS = [
     "Good response",
     "Bad response",
 ]
+# Every response is wrapped in a UI shell like:
+#   ### AI Mode reply for <query>\n\n# Shared\n\n0 files\n\n<actual answer>
+# Strip everything up to and including the "N files" line, whatever the
+# heading text around it looks like. The heading echoes the whole query back
+# verbatim, which can include a full condensed system prompt (up to
+# _QUERY_LIMIT chars) — so the window has to cover that, not just a short title.
+_HEADER_RE = re.compile(r"\A.{0,6000}?\n\s*\d+\s+files?\s*\n+", re.DOTALL | re.IGNORECASE)
 
 def _extract_text(html: str) -> str:
     html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
     html = re.sub(r"<style[^>]*>.*?</style>",   "", html, flags=re.DOTALL)
+    html = re.sub(r"<img[^>]*>", "", html)
 
     # Convert HTML formatting to Markdown
-    raw = _md(html, heading_style="ATX", bullets="-", newline_style="backslash")
+    raw = _md(html, heading_style="ATX", bullets="-")
+
+    # Strip the "AI Mode reply for ... / Shared / N files" UI header
+    m = _HEADER_RE.match(raw)
+    if m:
+        raw = raw[m.end():]
 
     # Cut off boilerplate that follows the actual answer
     for marker in _CUT_MARKERS:
@@ -265,6 +319,20 @@ class Message(BaseModel):
     role: str
     content: str
 
+    @field_validator("content", mode="before")
+    @classmethod
+    def _flatten_content(cls, v):
+        # Some clients send OpenAI's multimodal "content parts" array even for
+        # plain text, e.g. [{"type": "text", "text": "hi"}]. Flatten to a string;
+        # non-text parts (images etc.) are dropped — this API is text-only.
+        if isinstance(v, list):
+            return "".join(
+                part.get("text", "")
+                for part in v
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        return v
+
 class ChatRequest(BaseModel):
     model: str = "google-ai"
     messages: list[Message]
@@ -279,32 +347,25 @@ async def chat_completions(req: ChatRequest):
         raise HTTPException(status_code=400, detail="No user messages.")
 
     last = user_msgs[-1]["content"]
-    conv_id = str(uuid.uuid4())   # new session per request for now
+    conv_id = str(uuid.uuid4())
 
-    # Fresh session from config for each request
-    # (tokens from config are reusable — only q changes)
-    try:
-        session = session_from_config()
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    _evict_stale_sessions()
 
-    # Pull out system messages and build conversation history
-    system_msgs = [m for m in messages if m["role"] == "system"]
-    chat_msgs   = [m for m in messages if m["role"] != "system"]
+    # Continuing an existing conversation? Google tracks state server-side via
+    # ei/elrc/stkp/mstk, so a resumed session only needs the newest message —
+    # see _conv_key for how the prefix hash matches across turns.
+    prefix_key = _conv_key(messages[:-1]) if len(messages) > 1 else None
+    resumed = prefix_key is not None and prefix_key in _sessions
 
-    parts = []
-    if system_msgs:
-        system_text = "\n".join(m["content"] for m in system_msgs)
-        system_text = _condense_system(system_text)
-        parts.append(f"[System instructions]\n{system_text}\n[End system instructions]")
-
-    if len(chat_msgs) > 1:
-        for m in chat_msgs[:-1]:
-            role = "User" if m["role"] == "user" else "Assistant"
-            parts.append(f"{role}: {m['content']}")
-
-    parts.append(f"User: {last}")
-    query = "\n".join(parts)
+    if resumed:
+        session = _sessions[prefix_key]
+        query = last
+    else:
+        try:
+            session = session_from_config()
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        query = _build_query(messages, last)
 
     async with httpx.AsyncClient(
         headers={**HEADERS, "Cookie": session.cookies},
@@ -314,14 +375,30 @@ async def chat_completions(req: ChatRequest):
     ) as client:
         try:
             text, session = await fetch_ai_response(client, session, query)
-        except HTTPException:
-            raise
+        except HTTPException as e:
+            if resumed and e.status_code == 401:
+                # Resumed session's rotated tokens went stale independent of
+                # config.json — drop it and retry once as a fresh conversation
+                # rather than failing the request outright.
+                log.warning("Resumed session rejected by Google — retrying fresh")
+                _sessions.pop(prefix_key, None)
+                try:
+                    session = session_from_config()
+                except RuntimeError as ce:
+                    raise HTTPException(status_code=503, detail=str(ce))
+                query = _build_query(messages, last)
+                text, session = await fetch_ai_response(client, session, query)
+            else:
+                raise
         except Exception as e:
             log.exception("Error")
             raise HTTPException(status_code=500, detail=str(e))
 
     if not text:
         raise HTTPException(status_code=502, detail="Empty response from Google.")
+
+    session.last_used = time.time()
+    _sessions[_conv_key(messages + [{"role": "assistant", "content": text}])] = session
 
     if req.stream:
         return StreamingResponse(_stream(text, conv_id, req.model), media_type="text/event-stream")

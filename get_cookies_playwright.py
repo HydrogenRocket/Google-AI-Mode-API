@@ -35,6 +35,12 @@ _TOKEN_SCRIPT = """() => {
         fn_elrc:    f('fn-elrc'),
         xsrf_folif: f('xsrf-folif-token'),
         sca_esv:    sca,
+        // Newer token scheme seen alongside the original one (used by the
+        // /async/folwr restore endpoint as of Sept 2026) — captured for
+        // future use in case Google migrates /async/folif onto it too.
+        garc:           f('garc'),
+        lro_token:      f('lro-token'),
+        lro_signature:  f('lro-signature'),
     };
 }"""
 
@@ -76,15 +82,37 @@ def run() -> None:
             browser.close()
             sys.exit(1)
 
+        # srtst can populate a beat after [data-ei] shows up — poll for it
+        # specifically rather than assuming it's ready at the same instant.
+        try:
+            page.wait_for_function(
+                "() => !!document.querySelector('[data-srtst]')?.dataset.srtst",
+                timeout=20_000,
+            )
+        except PWTimeout:
+            print("WARNING: data-srtst stayed empty after waiting — continuing anyway,")
+            print("         but the fetched token set may be incomplete.")
+
         tokens = page.evaluate(_TOKEN_SCRIPT)
         cookies = context.cookies("https://www.google.com")
         browser.close()
 
-    required = ["ei", "srtst", "xsrf_folif"]
-    missing  = [k for k in required if not tokens.get(k)]
+    # ei/xsrf_folif are always required — without them nothing works. srtst
+    # is only warned about: Google's page has been inconsistent about
+    # populating it lately, and it may no longer be required by /async/folif
+    # at all (their own JS has shifted to a garc/lro-token/lro-signature
+    # scheme elsewhere on the page). Save whatever we got rather than
+    # discarding good tokens over one uncertain one — a stale srtst already
+    # in config.json is preserved below since empty values aren't written.
+    hard_required = ["ei", "xsrf_folif"]
+    missing = [k for k in hard_required if not tokens.get(k)]
     if missing:
         print(f"ERROR: Missing tokens: {missing}")
         sys.exit(1)
+    if not tokens.get("srtst"):
+        print("WARNING: srtst is empty — saving everything else anyway. "
+              "If config.json already has an srtst from a previous fetch, "
+              "it's left as-is; try the API and see if it still works.")
 
     cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
